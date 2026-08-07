@@ -9,8 +9,6 @@ written to msGraphConfig.json / orionAPIConfig.json on disk. This requires the
 env-var-aware config loaders added to msGraph.py and orionAPI.py (loadMsGraphConfig()
 / loadOrionConfig()), which fall back to the JSON files only when an env var isn't set.
 
-Reference: StoreIPad_AutoRename_KnowledgeArticle.docx
-
 Required Airflow Connections (create via UI: Admin > Connections, or `airflow
 connections add`):
 
@@ -86,7 +84,6 @@ with DAG(
     tags=["intune", "solarwinds", "store-ipads"],
     doc_md=__doc__,
 ) as dag:
-
     run_autorename = BashOperator(
         task_id="run_autorename_script",
         bash_command=f"cd {PROJECT_DIR} && python main.py",
