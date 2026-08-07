@@ -1,0 +1,10 @@
+# Only store_ipad_autorename_dag.py in this folder should be scanned/imported
+# by Airflow's DAG file processor. The files below are helper modules for
+# main.py, executed as a subprocess by the DAG's BashOperator (with PROJECT_DIR
+# as its cwd and MSGRAPH_*/ORION_* env vars injected at task-run time) -- they
+# are not meant to be imported directly by the scheduler/dag-processor, which
+# has neither of those in place and will fail their module-level config loading.
+main.py
+msGraph.py
+orionAPI.py
+jsonLogFormatter.py
