@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Airflow DAG: Store iPad Auto-Rename Tool</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8eb;
+    --muted: #9aa2af;
+    --accent: #6ea8fe;
+    --code-bg: #10131a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 20px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6;
+  }
+  .container { max-width: 880px; margin: 0 auto; }
+  h1 {
+    font-size: 1.6rem;
+    margin-bottom: 4px;
+  }
+  .subtitle { color: var(--muted); margin-bottom: 32px; font-size: 0.95rem; }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 22px 26px;
+    margin-bottom: 20px;
+  }
+  h2 {
+    font-size: 1.05rem;
+    margin-top: 0;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 10px;
+    margin-bottom: 14px;
+  }
+  h3 {
+    font-size: 0.95rem;
+    margin: 18px 0 8px;
+    color: var(--text);
+  }
+  p { margin: 0 0 10px; }
+  code, .mono {
+    font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 0.88em;
+    color: #f2c94c;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+  }
+  pre code { background: none; padding: 0; color: var(--text); }
+  ul, ol { margin: 0; padding-left: 20px; }
+  li { margin-bottom: 8px; }
+  ol.steps > li { margin-bottom: 16px; }
+  .conn-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    background: rgba(255,255,255,0.02);
+  }
+  .conn-name {
+    font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+    color: var(--accent);
+    font-size: 1rem;
+  }
+  .conn-type {
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-left: 6px;
+  }
+  .field-label { color: var(--muted); }
+  .note {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-top: 8px;
+  }
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-top: 30px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>Airflow DAG: Store iPad Auto-Rename Tool</h1>
+  <div class="subtitle">Reference page generated from Autorename.txt</div>
+
+  <section>
+    <h2>Overview</h2>
+    <p>
+      Runs the existing Store iPad AutoRename scripts
+      (<code>main.py</code> / <code>msGraph.py</code> / <code>orionAPI.py</code>)
+      on a daily schedule. MS Graph (Intune) and SolarWinds SWIS access both
+      go through Airflow-native connections/hooks now instead of custom
+      libraries:
+    </p>
+    <ul>
+      <li><code>msGraph.py</code> uses <code>airflow.providers.microsoft.azure.hooks.msgraph.KiotaRequestAdapterHook</code> against the <code>intune_device</code> connection. It handles the OAuth2 client-credentials token acquisition/caching itself &mdash; no msal or requests code remains.</li>
+      <li><code>orionAPI.py</code> uses <code>airflow.providers.http.hooks.http.HttpHook</code> against the <code>solarwinds</code> connection (HTTP Basic Auth straight to SWIS's REST query endpoint) &mdash; no orionsdk dependency remains.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>High-Level Process</h2>
+    <p>Calls <code>main.run()</code> in-process (via PythonOperator, not a bash subprocess &mdash; required for Airflow provider hooks to work under Airflow 3). <code>main.run()</code>:</p>
+    <ol>
+      <li>Authenticates to MS Graph (via KiotaRequestAdapterHook / the <code>intune_device</code> Connection) and SolarWinds SWIS (via HttpHook / the <code>solarwinds</code> Connection).</li>
+      <li>Queries Intune for iOS devices synced in the last 7 days.</li>
+      <li>Flags devices not matching <code>USA0[0-9]{4}-&lt;SerialNumber&gt;</code> or with a serial mismatch (skipping any named <code>LOST*</code>).</li>
+      <li>Looks up each device's store number in SolarWinds via its Wi-Fi MAC address.</li>
+      <li>Renames the device in Intune (POST setDeviceName, beta) and triggers a syncDevice call.</li>
+      <li>Logs structured JSON lines to stdout only &mdash; no local log file and no direct outbound logging call; a cluster-level log forwarder is responsible for shipping stdout onward.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Task Execution Model: PythonOperator, Not BashOperator</h2>
+    <p>
+      This task calls <code>main.run()</code> directly via PythonOperator instead of shelling
+      out to <code>python main.py</code>. That's a required change, not a style choice: under
+      Airflow 3, provider hooks (and <code>import airflow</code> itself) only work inside a
+      real Airflow task-execution context. A bash-spawned subprocess is a separate, plain
+      Python process &mdash; it lacks the Task SDK's execution-API plumbing, and its
+      <code>SQL_ALCHEMY_CONN</code> is intentionally set to a poison value
+      (<code>airflow-db-not-allowed:///</code>) to block direct metadata-DB access from task
+      code. Any <code>import airflow</code> in that subprocess (which <code>from airflow.providers...</code>
+      triggers) crashes trying to configure the ORM against that poisoned URL. Running
+      <code>main.run()</code> from a PythonOperator's <code>python_callable</code> keeps
+      execution inside the real task process, where connection resolution and hook auth work
+      as intended.
+    </p>
+    <p>
+      <code>main.py</code> itself is unchanged in structure otherwise &mdash; it just exposes
+      a <code>run()</code> function instead of executing at import time, so it's also still
+      runnable directly via <code>python main.py</code> for local/manual testing outside
+      Airflow.
+    </p>
+  </section>
+
+  <section>
+    <h2>Credential Source: AWS Systems Manager Parameter Store</h2>
+    <p>
+      The <code>intune_device</code> and <code>solarwinds</code> connections are resolved at
+      hook-call time from AWS SSM Parameter Store via Airflow's secrets backend chain &mdash;
+      this DAG's code doesn't need to know that; only the Airflow deployment config and the
+      parameters in AWS matter.
+    </p>
+
+    <ol class="steps">
+      <li>
+        Install <code>apache-airflow-providers-amazon</code> on the worker (pulls in boto3).
+      </li>
+      <li>
+        Configure the secrets backend (<code>airflow.cfg</code>, or equivalently the
+        <code>AIRFLOW__SECRETS__BACKEND</code> / <code>AIRFLOW__SECRETS__BACKEND_KWARGS</code>
+        env vars):
+        <pre><code>[secrets]
+backend = airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend
+backend_kwargs = {
+  "connections_prefix": "airflow/connections",
+  "variables_prefix": null,
+  "config_prefix": null,
+  "profile_name": null
+}</code></pre>
+        <div class="note">Setting variables_prefix/config_prefix to null means only Connections are looked up in SSM (no extra API calls for Variables/Config).</div>
+      </li>
+      <li>
+        Store each connection as a SecureString JSON parameter at <code>/airflow/connections/&lt;conn_id&gt;</code>:
+
+        <div class="conn-card" style="margin-top:12px;">
+          <span class="conn-name">/airflow/connections/intune_device</span>
+          <pre><code>{
+  "conn_type": "msgraph",
+  "login": "&lt;Azure App Registration client_id&gt;",
+  "password": "&lt;Azure App Registration client secret&gt;",
+  "extra": {
+    "tenant_id": "88807067-f283-4e67-95a7-48db7278c141"
+  }
+}</code></pre>
+          <div class="note">Scopes default to https://graph.microsoft.com/.default, which is what Intune needs &mdash; no need to set it explicitly unless you want something else.</div>
+        </div>
+
+        <div class="conn-card">
+          <span class="conn-name">/airflow/connections/solarwinds</span>
+          <pre><code>{
+  "conn_type": "http",
+  "host": "da2hqpnm32.babgsetc.pvt",
+  "schema": "https",
+  "port": 17774,
+  "login": "&lt;SWIS API username&gt;",
+  "password": "&lt;SWIS API password&gt;"
+}</code></pre>
+          <div class="note">host, schema, and port MUST be separate fields, not a scheme+port embedded in host &mdash; HttpHook appends the port field onto the base URL unconditionally, so combining both causes a double/wrong port.</div>
+        </div>
+      </li>
+      <li>
+        Grant the Airflow worker's IAM role <code>ssm:GetParameter</code> /
+        <code>ssm:GetParametersByPath</code> on
+        <code>arn:aws:ssm:&lt;region&gt;:&lt;account&gt;:parameter/airflow/connections/*</code>
+        and <code>kms:Decrypt</code> on the KMS key used to encrypt the SecureString params
+        (the default <code>alias/aws/ssm</code> key, unless a customer-managed key is used).
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Logging</h2>
+    <p>
+      <code>main.py</code> logs structured JSON lines to stdout (see
+      <code>jsonLogFormatter.py</code>) instead of a local file or a direct New Relic
+      API call. On Kubernetes this is the standard pattern &mdash; the task's log output
+      (which includes everything <code>main.run()</code> logs, since it executes in-process)
+      lands in the worker/task pod's container logs.
+    </p>
+    <p>
+      A cluster-level log forwarder (e.g. New Relic's Kubernetes integration, Fluent
+      Bit, etc. &mdash; whatever DaemonSet your cluster runs) tails those container logs
+      and ships them onward; the script itself makes no outbound logging calls and needs
+      no logging-related credentials.
+    </p>
+  </section>
+
+  <section>
+    <h2>Prerequisites on the Airflow Worker</h2>
+    <ul>
+      <li><code>apache-airflow-providers-microsoft-azure</code> (KiotaRequestAdapterHook, pulls in msgraph-core/kiota-*/azure-identity) &mdash; <code>apache-airflow-providers-http</code> ships with the base Airflow image already, no separate install needed for it</li>
+      <li><code>apache-airflow-providers-amazon</code> (for the SSM Parameter Store secrets backend)</li>
+      <li><code>PROJECT_DIR</code> points to the directory containing <code>main.py</code>, <code>msGraph.py</code>, <code>orionAPI.py</code>, and <code>jsonLogFormatter.py</code> (no config JSON files, no MSGRAPH_*/ORION_* env vars &mdash; credentials come only from the Airflow Connections below)</li>
+      <li>Network access from the worker to Microsoft Graph API, the SolarWinds Orion server, and the AWS SSM Parameter Store endpoint for your region</li>
+      <li>The <code>intune_device</code> and <code>solarwinds</code> connections are stored in AWS SSM Parameter Store as described above, and Airflow's [secrets] backend is configured to read them from there</li>
+      <li>Your cluster's log collection is configured to tail this pod's/container's stdout</li>
+    </ul>
+  </section>
+
+  <footer>Generated from Autorename.txt</footer>
+</div>
+</body>
+</html>

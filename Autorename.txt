@@ -1,0 +1,130 @@
+Airflow DAG: Store iPad Auto-Rename Tool
+
+Runs the existing Store iPad AutoRename scripts (main.py / msGraph.py / orionAPI.py)
+on a daily schedule. MS Graph (Intune) and SolarWinds SWIS access both go through
+Airflow-native connections/hooks now instead of custom libraries:
+
+  - msGraph.py uses airflow.providers.microsoft.azure.hooks.msgraph.KiotaRequestAdapterHook
+    against the 'intune_device' connection. It handles the OAuth2 client-credentials
+    token acquisition/caching itself -- no msal or requests code remains.
+  - orionAPI.py uses airflow.providers.http.hooks.http.HttpHook against the
+    'solarwinds' connection (HTTP Basic Auth straight to SWIS's REST query
+    endpoint) -- no orionsdk dependency remains.
+
+High level process
+
+  Calls main.run() in-process (via PythonOperator, not a bash subprocess --
+  required for Airflow provider hooks to work under Airflow 3). main.run():
+  1. Authenticates to MS Graph (via KiotaRequestAdapterHook / the
+     `intune_device` Connection) and SolarWinds SWIS (via HttpHook / the
+     `solarwinds` Connection).
+  2. Queries Intune for iOS devices synced in the last 7 days.
+  3. Flags devices not matching `USA0[0-9]{4}-<SerialNumber>` or with a
+     serial mismatch (skipping any named `LOST*`).
+  4. Looks up each device's store number in SolarWinds via its Wi-Fi MAC
+     address.
+  5. Renames the device in Intune (POST setDeviceName, beta) and triggers a
+     syncDevice call.
+  6. Logs structured JSON lines to stdout only -- no local log file and no
+     direct outbound logging call; a cluster-level log forwarder is
+     responsible for shipping stdout onward.
+
+Task execution model: PythonOperator, not BashOperator
+
+This task calls main.run() directly via PythonOperator instead of shelling out
+to `python main.py`. That's a required change, not a style choice: under
+Airflow 3, provider hooks (and `import airflow` itself) only work inside a
+real Airflow task-execution context. A bash-spawned subprocess is a separate,
+plain Python process -- it lacks the Task SDK's execution-API plumbing, and
+its SQL_ALCHEMY_CONN is intentionally set to a poison value
+("airflow-db-not-allowed:///") to block direct metadata-DB access from task
+code. Any `import airflow` in that subprocess (which `from airflow.providers...`
+triggers) crashes trying to configure the ORM against that poisoned URL. Running
+main.run() from a PythonOperator's python_callable keeps execution inside the
+real task process, where connection resolution and hook auth work as intended.
+
+main.py itself is unchanged in structure otherwise -- it just exposes a run()
+function instead of executing at import time, so it's also still runnable
+directly via `python main.py` for local/manual testing outside Airflow.
+
+Credential source: AWS Systems Manager Parameter Store
+
+The `intune_device` and `solarwinds` connections are resolved at hook-call time
+from AWS SSM Parameter Store via Airflow's secrets backend chain -- this DAG's
+code doesn't need to know that; only the Airflow deployment config and the
+parameters in AWS matter.
+
+1. Install `apache-airflow-providers-amazon` on the worker (pulls in boto3).
+
+2. Configure the secrets backend (airflow.cfg, or equivalently the
+   AIRFLOW__SECRETS__BACKEND / AIRFLOW__SECRETS__BACKEND_KWARGS env vars):
+
+     [secrets]
+     backend = airflow.providers.amazon.aws.secrets.systems_manager.SystemsManagerParameterStoreBackend
+     backend_kwargs = {
+       "connections_prefix": "airflow/connections",
+       "variables_prefix": null,
+       "config_prefix": null,
+       "profile_name": null
+     }
+
+   Setting variables_prefix/config_prefix to null means only Connections are
+   looked up in SSM (no extra API calls for Variables/Config).
+
+3. Store each connection as a SecureString JSON parameter at
+   `/airflow/connections/<conn_id>`:
+
+     /airflow/connections/intune_device =
+       {
+         "conn_type": "msgraph",
+         "login": "<Azure App Registration client_id>",
+         "password": "<Azure App Registration client secret>",
+         "extra": {
+           "tenant_id": "88807067-f283-4e67-95a7-48db7278c141"
+         }
+       }
+     (scopes default to https://graph.microsoft.com/.default, which is what
+     Intune needs -- no need to set it explicitly unless you want something else)
+
+     /airflow/connections/solarwinds =
+       {
+         "conn_type": "http",
+         "host": "da2hqpnm32.babgsetc.pvt",
+         "schema": "https",
+         "port": 17774,
+         "login": "<SWIS API username>",
+         "password": "<SWIS API password>"
+       }
+     (host, schema, and port MUST be separate fields, not a scheme+port
+     embedded in host -- HttpHook appends the port field onto the base URL
+     unconditionally, so combining both causes a double/wrong port)
+
+4. Grant the Airflow worker's IAM role `ssm:GetParameter` /
+   `ssm:GetParametersByPath` on `arn:aws:ssm:<region>:<account>:parameter/airflow/connections/*`
+   and `kms:Decrypt` on the KMS key used to encrypt the SecureString params
+   (the default `alias/aws/ssm` key, unless a customer-managed key is used).
+
+Logging: main.py logs structured JSON lines to stdout (see jsonLogFormatter.py)
+instead of a local file or a direct New Relic API call. On Kubernetes this is
+the standard pattern -- the task's log output (which includes everything
+main.run() logs, since it executes in-process) lands in the worker/task pod's
+container logs. A cluster-level log forwarder (e.g. New Relic's Kubernetes
+integration, Fluent Bit, etc. -- whatever DaemonSet your cluster runs) tails
+those container logs and ships them onward; the script itself makes no
+outbound logging calls and needs no logging-related credentials.
+
+Prerequisites on the Airflow worker:
+  - apache-airflow-providers-microsoft-azure (KiotaRequestAdapterHook, pulls in
+    msgraph-core/kiota-*/azure-identity) -- apache-airflow-providers-http ships
+    with the base Airflow image already, no separate install needed for it
+  - apache-airflow-providers-amazon (for the SSM Parameter Store secrets backend)
+  - PROJECT_DIR (below) points to the directory containing main.py, msGraph.py,
+    orionAPI.py, and jsonLogFormatter.py (no config JSON files, no MSGRAPH_*/
+    ORION_* env vars -- credentials come only from the Airflow Connections below)
+  - Network access from the worker to Microsoft Graph API, the SolarWinds
+    Orion server, and the AWS SSM Parameter Store endpoint for your region
+  - The intune_device and solarwinds connections are stored in AWS SSM
+    Parameter Store as described above, and Airflow's [secrets] backend is
+    configured to read them from there
+  - Your cluster's log collection is configured to tail this pod's/container's
+    stdout
